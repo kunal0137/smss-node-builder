@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: build-system
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: build-service-config
+  namespace: build-system
+data:
+  PORT: "3000"
+  MAX_CONCURRENT_BUILDS: "3"
+  BUILD_MEMORY_LIMIT_MB: "512"
+  BUILD_TIMEOUT_MS: "300000"
+  MAX_UPLOAD_MB: "100"
+  WORK_DIR: "/tmp/builds"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: build-service
+  namespace: build-system
+  labels:
+    app: build-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: build-service
+  template:
+    metadata:
+      labels:
+        app: build-service
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: build-service
+      containers:
+        - name: build-service
+          image: your-registry/build-service:latest
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: build-service-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "768Mi"
+            limits:
+              cpu: "2"
+              memory: "1792Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 1
+          volumeMounts:
+            - name: tmp-builds
+              mountPath: /tmp/builds
+            - name: tmp-uploads
+              mountPath: /tmp/uploads
+      volumes:
+        - name: tmp-builds
+          emptyDir:
+            sizeLimit: 5Gi
+        - name: tmp-uploads
+          emptyDir:
+            sizeLimit: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: build-service
+  namespace: build-system
+spec:
+  selector:
+    app: build-service
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+  type: ClusterIP
+  sessionAffinity: None
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: build-service-hpa
+  namespace: build-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: build-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
