@@ -2,8 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
-import { mkdir, rm } from 'fs/promises';
-import { createWriteStream } from 'fs';
+import { mkdir, rm, rename, access } from 'fs/promises';
 import { join } from 'path';
 import extractZip from 'extract-zip';
 import archiver from 'archiver';
@@ -17,8 +16,8 @@ const MAX_UPLOAD_MB = parseInt(process.env.MAX_UPLOAD_MB || '100', 10);
 const WORK_DIR = process.env.WORK_DIR || '/tmp/builds';
 const UPLOADS_DIR = process.env.UPLOADS_DIR || '/tmp/uploads';
 
-// Track active builds
-const builds = new Map();
+// Simple counter — no job Map needed for synchronous mode
+let activeBuilds = 0;
 
 const app = express();
 
@@ -32,7 +31,6 @@ app.use((req, res, next) => {
 await mkdir(WORK_DIR, { recursive: true });
 await mkdir(UPLOADS_DIR, { recursive: true });
 
-// Multer config: store uploads in UPLOADS_DIR, limit by MAX_UPLOAD_MB
 const storage = multer.diskStorage({
   destination: UPLOADS_DIR,
   filename: (req, file, cb) => cb(null, `${randomUUID()}.zip`),
@@ -43,242 +41,197 @@ const upload = multer({
   limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 },
 });
 
-// Cleanup helper
-async function cleanupBuild(jobId) {
-  const build = builds.get(jobId);
-  if (!build) return;
-  builds.delete(jobId);
+// Check if a path exists
+async function pathExists(p) {
   try {
-    await rm(build.workDir, { recursive: true, force: true });
+    await access(p);
+    return true;
   } catch {
-    // ignore cleanup errors
+    return false;
   }
 }
 
-// POST /build — accept zip, run build in background
-app.post('/build', (req, res, next) => {
-  // Check capacity before accepting upload
-  if (builds.size >= MAX_CONCURRENT_BUILDS) {
-    return res.status(503).json({ error: 'Pod at capacity' });
-  }
-  next();
-}, upload.single('source'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'Missing required field: source (zip file)' });
-  }
+// Run a shell command; resolves with stdout+stderr, rejects with exit code + logs on failure
+function runCommand(cmd, cwd, env) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('sh', ['-c', cmd], { cwd, env });
+    const chunks = [];
 
-  // Re-check capacity after upload (race condition guard)
-  if (builds.size >= MAX_CONCURRENT_BUILDS) {
-    await rm(req.file.path, { force: true }).catch(() => {});
-    return res.status(503).json({ error: 'Pod at capacity' });
-  }
+    proc.stdout.on('data', (d) => chunks.push(d.toString()));
+    proc.stderr.on('data', (d) => chunks.push(d.toString()));
 
-  const jobId = randomUUID();
-  const workDir = join(WORK_DIR, jobId);
-  const buildCmd = req.query.buildCmd || 'pnpm install && pnpm build';
-  const outDir = req.query.outDir || 'dist';
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      const err = new Error(`Build timed out after ${BUILD_TIMEOUT_MS}ms`);
+      err.logs = chunks.join('');
+      reject(err);
+    }, BUILD_TIMEOUT_MS);
 
-  const buildEntry = {
-    status: 'extracting',
-    startedAt: Date.now(),
-    workDir,
-    outDir,
-    proc: null,
-    logs: [],
-  };
-  builds.set(jobId, buildEntry);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      const logs = chunks.join('');
+      if (code === 0) {
+        resolve(logs);
+      } else {
+        const err = new Error(`Build exited with code ${code}`);
+        err.logs = logs;
+        reject(err);
+      }
+    });
 
-  res.status(202).json({ jobId, status: 'accepted' });
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      err.logs = chunks.join('');
+      reject(err);
+    });
+  });
+}
 
-  // Run build in background
-  (async () => {
+// POST /build
+//
+// Accepts multipart/form-data with field `source` (a zipped client folder).
+// The zip should contain either:
+//   - a top-level `client/` directory (the full SEMOSS project root), or
+//   - the client folder contents directly (auto-wrapped in client/)
+//
+// Runs `pnpm install && pnpm build` inside the client dir.
+// Vite is configured (in the SEMOSS template) to output to ../../portals relative
+// to src/, which resolves to portals/ next to the client/ directory.
+//
+// Responds synchronously with the portals/ folder zipped as portals.zip.
+// Optional query params:
+//   ?buildCmd=  override the build command  (default: pnpm install && pnpm build)
+//   ?outDir=    override the output dir name (default: portals)
+app.post(
+  '/build',
+  (req, res, next) => {
+    if (activeBuilds >= MAX_CONCURRENT_BUILDS) {
+      return res.status(503).json({ error: 'Pod at capacity' });
+    }
+    next();
+  },
+  upload.single('source'),
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Missing required field: source (zip file)' });
+    }
+
+    // Re-check after upload completes (race condition guard)
+    if (activeBuilds >= MAX_CONCURRENT_BUILDS) {
+      await rm(req.file.path, { force: true }).catch(() => {});
+      return res.status(503).json({ error: 'Pod at capacity' });
+    }
+
+    activeBuilds++;
+    const workDir = join(WORK_DIR, randomUUID());
+
     try {
       await mkdir(workDir, { recursive: true });
 
-      // Extract zip
+      // ── 1. Extract zip ────────────────────────────────────────────────────
       await extractZip(req.file.path, { dir: workDir });
       await rm(req.file.path, { force: true }).catch(() => {});
 
-      if (!builds.has(jobId)) return; // deleted while extracting
-      builds.get(jobId).status = 'building';
+      // ── 2. Locate the client dir ──────────────────────────────────────────
+      // Case A: zip had a top-level client/ wrapper  → workDir/client/package.json
+      // Case B: zip contained client contents directly → workDir/package.json
+      // In both cases we want buildDir = workDir/client/ so portals lands at workDir/portals/
+      let buildDir;
 
-      // Build memory limit via ulimit + NODE_OPTIONS
+      if (await pathExists(join(workDir, 'client', 'package.json'))) {
+        // Case A — already structured correctly
+        buildDir = join(workDir, 'client');
+      } else if (await pathExists(join(workDir, 'package.json'))) {
+        // Case B — wrap the bare contents inside a client/ subdirectory
+        const tmpName = join(WORK_DIR, `${randomUUID()}-wrap`);
+        await rename(workDir, tmpName);           // workDir → tmpName
+        await mkdir(workDir, { recursive: true }); // recreate workDir
+        await rename(tmpName, join(workDir, 'client')); // tmpName → workDir/client
+        buildDir = join(workDir, 'client');
+      } else {
+        return res.status(400).json({ error: 'No package.json found in uploaded zip' });
+      }
+
+      // ── 3. Run the build ──────────────────────────────────────────────────
+      const buildCmd = req.query.buildCmd || 'pnpm install && pnpm build';
       const ulimitKB = BUILD_MEMORY_LIMIT_MB * 1024;
       const shellCmd = `ulimit -v ${ulimitKB}; ${buildCmd}`;
 
-      const proc = spawn('sh', ['-c', shellCmd], {
-        cwd: workDir,
-        env: {
-          ...process.env,
-          NODE_OPTIONS: `--max-old-space-size=${BUILD_MEMORY_LIMIT_MB}`,
-          PNPM_HOME: join(workDir, '.pnpm-store'),
-          PATH: process.env.PATH,
-        },
+      await runCommand(shellCmd, buildDir, {
+        ...process.env,
+        NODE_OPTIONS: `--max-old-space-size=${BUILD_MEMORY_LIMIT_MB}`,
+        // Isolate pnpm store to avoid cross-build cache collisions
+        PNPM_HOME: join(workDir, '.pnpm-store'),
+        PATH: process.env.PATH,
       });
 
-      builds.get(jobId).proc = proc;
+      // ── 4. Locate output dir ─────────────────────────────────────────────
+      // SEMOSS vite.config.ts: root="src", outDir="../../portals"
+      // → resolves to portals/ sitting next to client/ (i.e. workDir/portals/)
+      const outDirName = req.query.outDir || 'portals';
+      const portalsDir = join(workDir, outDirName);
 
-      const timeout = setTimeout(() => {
-        if (builds.has(jobId) && builds.get(jobId).status === 'building') {
-          proc.kill('SIGKILL');
-          const entry = builds.get(jobId);
-          if (entry) {
-            entry.status = 'failed';
-            entry.error = `Build timed out after ${BUILD_TIMEOUT_MS}ms`;
-          }
-        }
-      }, BUILD_TIMEOUT_MS);
+      if (!(await pathExists(portalsDir))) {
+        return res.status(500).json({
+          error: `Build succeeded but output directory '${outDirName}' was not found`,
+        });
+      }
 
-      const collectOutput = (chunk) => {
-        const entry = builds.get(jobId);
-        if (entry) entry.logs.push(chunk.toString());
-      };
+      // ── 5. Stream portals.zip back ────────────────────────────────────────
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', 'attachment; filename="portals.zip"');
 
-      proc.stdout.on('data', collectOutput);
-      proc.stderr.on('data', collectOutput);
+      const archive = archiver('zip', { zlib: { level: 6 } });
 
-      proc.on('close', (code) => {
-        clearTimeout(timeout);
-        const entry = builds.get(jobId);
-        if (!entry) return;
-        if (entry.status === 'failed') return; // timeout already set it
-        entry.status = code === 0 ? 'complete' : 'failed';
-        if (code !== 0) {
-          entry.error = `Build process exited with code ${code}`;
-        }
-        entry.proc = null;
+      archive.on('error', (err) => {
+        console.error('Archiver error:', err);
+        if (!res.headersSent) res.status(500).json({ error: err.message });
       });
 
-      proc.on('error', (err) => {
-        clearTimeout(timeout);
-        const entry = builds.get(jobId);
-        if (!entry) return;
-        entry.status = 'failed';
-        entry.error = err.message;
-        entry.proc = null;
-      });
+      archive.pipe(res);
+      archive.directory(portalsDir, false);
+      await archive.finalize();
+
     } catch (err) {
       await rm(req.file.path, { force: true }).catch(() => {});
-      const entry = builds.get(jobId);
-      if (entry) {
-        entry.status = 'failed';
-        entry.error = err.message;
+      console.error('Build error:', err.message);
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: err.message,
+          ...(err.logs ? { logs: err.logs } : {}),
+        });
       }
-    }
-  })();
-});
-
-// GET /build/:id — job status
-app.get('/build/:id', (req, res) => {
-  const build = builds.get(req.params.id);
-  if (!build) {
-    return res.status(404).json({ error: 'Build not found' });
-  }
-
-  const response = {
-    status: build.status,
-    elapsedMs: Date.now() - build.startedAt,
-  };
-
-  if (build.logs.length > 0) {
-    response.logs = build.logs.join('');
-  }
-
-  if (build.error) {
-    response.error = build.error;
-  }
-
-  res.json(response);
-});
-
-// GET /build/:id/download — stream outDir as zip
-app.get('/build/:id/download', async (req, res) => {
-  const build = builds.get(req.params.id);
-  if (!build) {
-    return res.status(404).json({ error: 'Build not found' });
-  }
-
-  if (build.status !== 'complete') {
-    return res.status(409).json({ error: `Build is not complete (status: ${build.status})` });
-  }
-
-  const outDirPath = join(build.workDir, build.outDir);
-
-  res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="build-${req.params.id}.zip"`);
-
-  const archive = archiver('zip', { zlib: { level: 6 } });
-
-  archive.on('error', (err) => {
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  archive.pipe(res);
-  archive.directory(outDirPath, false);
-  await archive.finalize();
-
-  res.on('close', async () => {
-    await cleanupBuild(req.params.id);
-  });
-});
-
-// DELETE /build/:id — kill and clean up
-app.delete('/build/:id', async (req, res) => {
-  const build = builds.get(req.params.id);
-  if (!build) {
-    return res.status(404).json({ error: 'Build not found' });
-  }
-
-  if (build.proc) {
-    try {
-      build.proc.kill('SIGKILL');
-    } catch {
-      // ignore if already dead
+    } finally {
+      activeBuilds--;
+      // Clean up workDir after response is fully sent
+      res.on('close', () => {
+        rm(workDir, { recursive: true, force: true }).catch(() => {});
+      });
     }
   }
-
-  await cleanupBuild(req.params.id);
-  res.json({ status: 'deleted' });
-});
+);
 
 // GET /health
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    activeBuilds: builds.size,
+    activeBuilds,
     maxConcurrent: MAX_CONCURRENT_BUILDS,
   });
 });
 
 // GET /ready — Kubernetes readiness probe
+// Returns 503 when saturated so the pod is pulled from the load balancer
 app.get('/ready', (req, res) => {
-  if (builds.size < MAX_CONCURRENT_BUILDS) {
-    res.status(200).json({ status: 'ready', activeBuilds: builds.size });
+  if (activeBuilds < MAX_CONCURRENT_BUILDS) {
+    res.status(200).json({ status: 'ready', activeBuilds });
   } else {
     res.status(503).json({ error: 'Pod at capacity' });
   }
 });
 
-// Background GC: remove stale complete/failed builds older than 30 minutes
-const GC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const GC_MAX_AGE_MS = 30 * 60 * 1000;  // 30 minutes
-
-setInterval(async () => {
-  const now = Date.now();
-  for (const [jobId, build] of builds.entries()) {
-    if (
-      (build.status === 'complete' || build.status === 'failed') &&
-      now - build.startedAt > GC_MAX_AGE_MS
-    ) {
-      await cleanupBuild(jobId);
-    }
-  }
-}, GC_INTERVAL_MS);
-
 app.listen(PORT, () => {
-  console.log(`Build service listening on port ${PORT}`);
+  console.log(`SEMOSS build service listening on port ${PORT}`);
   console.log(`Max concurrent builds: ${MAX_CONCURRENT_BUILDS}`);
   console.log(`Build memory limit: ${BUILD_MEMORY_LIMIT_MB}MB`);
   console.log(`Build timeout: ${BUILD_TIMEOUT_MS}ms`);
