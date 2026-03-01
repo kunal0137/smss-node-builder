@@ -10,7 +10,7 @@ import archiver from 'archiver';
 // Config from env vars with defaults
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const MAX_CONCURRENT_BUILDS = parseInt(process.env.MAX_CONCURRENT_BUILDS || '3', 10);
-const BUILD_MEMORY_LIMIT_MB = parseInt(process.env.BUILD_MEMORY_LIMIT_MB || '512', 10);
+const BUILD_MEMORY_LIMIT_MB = parseInt(process.env.BUILD_MEMORY_LIMIT_MB || '1024', 10);
 const BUILD_TIMEOUT_MS = parseInt(process.env.BUILD_TIMEOUT_MS || '300000', 10);
 const MAX_UPLOAD_MB = parseInt(process.env.MAX_UPLOAD_MB || '100', 10);
 const WORK_DIR = process.env.WORK_DIR || '/tmp/builds';
@@ -154,8 +154,7 @@ app.post(
 
       // ── 3. Run the build ──────────────────────────────────────────────────
       const buildCmd = req.query.buildCmd || 'pnpm install && pnpm build';
-      const ulimitKB = BUILD_MEMORY_LIMIT_MB * 1024;
-      const shellCmd = `ulimit -v ${ulimitKB}; ${buildCmd}`;
+      const shellCmd = buildCmd;
 
       await runCommand(shellCmd, buildDir, {
         ...process.env,
