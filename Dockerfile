@@ -9,7 +9,7 @@ RUN apk add --no-cache zip unzip bash
 WORKDIR /app
 
 # Install dependencies first (layer caching)
-COPY package.json ./
+COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 # Copy application source
