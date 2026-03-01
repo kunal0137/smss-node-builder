@@ -159,6 +159,7 @@ app.post(
 
       await runCommand(shellCmd, buildDir, {
         ...process.env,
+        CI: 'true',
         NODE_OPTIONS: `--max-old-space-size=${BUILD_MEMORY_LIMIT_MB}`,
         // Isolate pnpm store to avoid cross-build cache collisions
         PNPM_HOME: join(workDir, '.pnpm-store'),
