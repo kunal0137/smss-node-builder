@@ -153,7 +153,8 @@ app.post(
       }
 
       // ── 3. Run the build ──────────────────────────────────────────────────
-      const buildCmd = req.query.buildCmd || 'pnpm install && pnpm build';
+      // const buildCmd = req.query.buildCmd || 'pnpm install && pnpm build';
+      const buildCmd = req.query.buildCmd || 'pnpm install --no-frozen-lockfile && pnpm build';
       const shellCmd = buildCmd;
 
       await runCommand(shellCmd, buildDir, {
