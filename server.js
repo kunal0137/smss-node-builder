@@ -88,20 +88,6 @@ function runCommand(cmd, cwd, env) {
 }
 
 // POST /build
-//
-// Accepts multipart/form-data with field `source` (a zipped client folder).
-// The zip should contain either:
-//   - a top-level `client/` directory (the full SEMOSS project root), or
-//   - the client folder contents directly (auto-wrapped in client/)
-//
-// Runs `pnpm install && pnpm build` inside the client dir.
-// Vite is configured (in the SEMOSS template) to output to ../../portals relative
-// to src/, which resolves to portals/ next to the client/ directory.
-//
-// Responds synchronously with the portals/ folder zipped as portals.zip.
-// Optional query params:
-//   ?buildCmd=  override the build command  (default: pnpm install && pnpm build)
-//   ?outDir=    override the output dir name (default: portals)
 app.post(
   '/build',
   (req, res, next) => {
@@ -116,7 +102,6 @@ app.post(
       return res.status(400).json({ error: 'Missing required field: source (zip file)' });
     }
 
-    // Re-check after upload completes (race condition guard)
     if (activeBuilds >= MAX_CONCURRENT_BUILDS) {
       await rm(req.file.path, { force: true }).catch(() => {});
       return res.status(503).json({ error: 'Pod at capacity' });
@@ -133,42 +118,64 @@ app.post(
       await rm(req.file.path, { force: true }).catch(() => {});
 
       // ── 2. Locate the client dir ──────────────────────────────────────────
-      // Case A: zip had a top-level client/ wrapper  → workDir/client/package.json
-      // Case B: zip contained client contents directly → workDir/package.json
-      // In both cases we want buildDir = workDir/client/ so portals lands at workDir/portals/
       let buildDir;
 
       if (await pathExists(join(workDir, 'client', 'package.json'))) {
-        // Case A — already structured correctly
         buildDir = join(workDir, 'client');
       } else if (await pathExists(join(workDir, 'package.json'))) {
-        // Case B — wrap the bare contents inside a client/ subdirectory
         const tmpName = join(WORK_DIR, `${randomUUID()}-wrap`);
-        await rename(workDir, tmpName);           // workDir → tmpName
-        await mkdir(workDir, { recursive: true }); // recreate workDir
-        await rename(tmpName, join(workDir, 'client')); // tmpName → workDir/client
+        await rename(workDir, tmpName);
+        await mkdir(workDir, { recursive: true });
+        await rename(tmpName, join(workDir, 'client'));
         buildDir = join(workDir, 'client');
       } else {
         return res.status(400).json({ error: 'No package.json found in uploaded zip' });
       }
 
       // ── 3. Run the build ──────────────────────────────────────────────────
-      // const buildCmd = req.query.buildCmd || 'pnpm install && pnpm build';
       const buildCmd = req.query.buildCmd || 'pnpm install --no-frozen-lockfile && pnpm build';
       const shellCmd = buildCmd;
+
+      // ── DEBUG: log exactly what we're about to run ────────────────────────
+      console.log('========== BUILD DEBUG START ==========');
+      console.log('[build] query:', JSON.stringify(req.query));
+      console.log('[build] cwd:', buildDir);
+      console.log('[build] cmd:', shellCmd);
+
+      // ── DEBUG: probe the environment inside the build dir ─────────────────
+      await runCommand(
+        'echo "--- pnpm version ---"; pnpm -v; ' +
+        'echo "--- pnpm config list ---"; pnpm config list; ' +
+        'echo "--- env CI ---"; echo "CI=$CI"; ' +
+        'echo "--- .npmrc files ---"; ' +
+        'for f in .npmrc ../.npmrc ~/.npmrc /etc/npmrc; do ' +
+        '  if [ -f "$f" ]; then echo "FOUND: $f"; cat "$f"; else echo "not found: $f"; fi; ' +
+        'done; ' +
+        'echo "--- pnpm-lock.yaml ---"; ' +
+        'if [ -f pnpm-lock.yaml ]; then ls -la pnpm-lock.yaml; head -5 pnpm-lock.yaml; else echo "no lockfile"; fi; ' +
+        'echo "--- pnpm-workspace.yaml ---"; ' +
+        'ls -la pnpm-workspace.yaml ../pnpm-workspace.yaml 2>/dev/null || echo "no workspace yaml"; ' +
+        'echo "--- parent dir ---"; ls -la ..',
+        buildDir,
+        { ...process.env, CI: 'true', PATH: process.env.PATH }
+      ).then(logs => {
+        console.log('[debug probe output]');
+        console.log(logs);
+      }).catch(err => {
+        console.log('[debug probe failed]', err.message, err.logs);
+      });
+
+      console.log('========== BUILD DEBUG END ==========');
 
       await runCommand(shellCmd, buildDir, {
         ...process.env,
         CI: 'true',
         NODE_OPTIONS: `--max-old-space-size=${BUILD_MEMORY_LIMIT_MB}`,
-        // Isolate pnpm store to avoid cross-build cache collisions
         PNPM_HOME: join(workDir, '.pnpm-store'),
         PATH: process.env.PATH,
       });
 
       // ── 4. Locate output dir ─────────────────────────────────────────────
-      // SEMOSS vite.config.ts: root="src", outDir="../../portals"
-      // → resolves to portals/ sitting next to client/ (i.e. workDir/portals/)
       const outDirName = req.query.outDir || 'portals';
       const portalsDir = join(workDir, outDirName);
 
@@ -196,6 +203,7 @@ app.post(
     } catch (err) {
       await rm(req.file.path, { force: true }).catch(() => {});
       console.error('Build error:', err.message);
+      console.error('Build error logs:', err.logs);
       if (!res.headersSent) {
         res.status(500).json({
           error: err.message,
@@ -204,7 +212,6 @@ app.post(
       }
     } finally {
       activeBuilds--;
-      // Clean up workDir after response is fully sent
       res.on('close', () => {
         rm(workDir, { recursive: true, force: true }).catch(() => {});
       });
@@ -221,8 +228,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// GET /ready — Kubernetes readiness probe
-// Returns 503 when saturated so the pod is pulled from the load balancer
+// GET /ready
 app.get('/ready', (req, res) => {
   if (activeBuilds < MAX_CONCURRENT_BUILDS) {
     res.status(200).json({ status: 'ready', activeBuilds });
