@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
 # Enable corepack and activate latest pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 
 # Install required system utilities
 RUN apk add --no-cache zip unzip bash
