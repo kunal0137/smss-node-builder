@@ -1,7 +1,9 @@
 FROM node:24-alpine
 
-# Enable corepack and activate latest pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
+
+ENV PNPM_CONFIG_DANGEROUSLY_ALLOW_ALL_BUILDS=true \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 # Install required system utilities
 RUN apk add --no-cache zip unzip bash
